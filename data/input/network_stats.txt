@@ -1,0 +1,22 @@
+Ring Topology Network Statistics
+===============================
+
+Nodes:
+  Total nodes: 40
+  SW nodes: 5
+  WN nodes: 5
+  WED nodes: 25
+  ED nodes: 5
+
+Links:
+  Total links: 40
+  0 links: 15
+  1 links: 25
+
+Streams:
+  Total streams: 3000
+
+Jitter Settings:
+  WED-WED jitter factors: [0.1, 0.2, 0.3, 0.4, 0.5]
+  ED-ED jitter factors: [0.1, 0.2, 0.3, 0.4, 0.5]
+  WED-ED jitter factors: [0.1, 0.2, 0.3, 0.4, 0.5]
