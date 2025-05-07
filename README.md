@@ -8,7 +8,7 @@ https://www.gurobi.com/academia/academic-program-and-licenses/?gad_source=1&gad_
 To run: python script.py
 
 Example input has 280 streams, and it schedules by batches of 10
-Run script.py for scheduling , if needed arguments can be passed. (parse_args() function in script.py)
-Output created for output folder.
+If needed arguments can be passed. (parse_args() function in script.py)
+Output created in output folder.
 
 
