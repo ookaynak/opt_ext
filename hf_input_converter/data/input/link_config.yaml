@@ -1,5 +1,5 @@
 link_types:
-  '0':
+  '100':
     best_case_speed: 100  # in bits per microsecond : 100Mbps = 100 bits per microseconds
     worst_case_speed: 100 # Example: 1000 Byte transmission is: (1000*8)/100 = 80 microseconds + processing + propagation
     processing_time: 0  # in microseconds
