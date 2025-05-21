@@ -3,29 +3,31 @@ import uuid
 import shutil
 import time
 import csv
+import networkx as nx
 from datetime import datetime
 from models.batches.optimization_model import OptimizationModel
 from models.data_factory import DataFactory
 from utils.helper import (
-    save_as_csv,
+    load_streams_from_csv,
     save_as_pkl,
-    load_pickle_as_dict,
+    load_yaml_file,
     load_graphml,
 )
 from utils.path_manager import PathManager
 from models.output_generator import OutputManager
 from typing import List, Dict
+from models.data_factory import DataFactory
 
 
 def solve_with_batches(
-    stream_dict, output_path, batches: List[List[int]], time_limit=3600
+    data_factory, output_path, batches: List[List[int]], time_limit=3600
 ):
     """
     Solve the scheduling problem iteratively with exactly the specified batches.
     Batches should not have overlapping streams.
 
     Args:
-        stream_dict: Dictionary of stream data
+        data_factory: DataFactory instance to create the optimization model
         output_path: Path to save outputs
         batches: List of batches, where each batch is a list of stream indices
         time_limit: Maximum solver time in seconds per iteration
@@ -34,8 +36,8 @@ def solve_with_batches(
         tuple: Status, all decision variables, and timing information
     """
     # Create logs directory
-    logs_dir = os.path.join(output_path, "solver_files")
-    os.makedirs(logs_dir, exist_ok=True)
+    solver_output_dir = os.path.join(output_path, "solver_files")
+    os.makedirs(solver_output_dir, exist_ok=True)
 
     # Initialize timing tracking
     timing_info = {
@@ -44,10 +46,9 @@ def solve_with_batches(
         "total_time": 0,
     }
 
-    data_factory = DataFactory(stream_dict=stream_dict)
     model = OptimizationModel(
-        datafactory=data_factory,
-        output_path=logs_dir,  # Changed to logs_dir
+        data_factory=data_factory,
+        output_path=solver_output_dir,
         time_limit=time_limit,
     )
 
@@ -109,19 +110,15 @@ def solve_with_batches(
 
     # Get final results
     print("\n=== FINAL RESULTS ===")
-    variables, variables_x, variables_y, variables_z, variables_a = (
-        model.get_solution_variables()
-    )
+    variables_x, variables_z, variables_a = model.get_solution_variables()
 
-    print(f"Total scheduled streams: {len(all_scheduled)} out of {len(stream_dict)}")
+    print(f"Total scheduled streams: {len(all_scheduled)} out of {len(data_factory.stream_dict)}")
     print(f"Scheduled stream IDs: {sorted(all_scheduled)}")
     print(f"Total optimization time: {total_duration:.2f} seconds")
 
     return (
         last_status,
-        variables,
         variables_x,
-        variables_y,
         variables_z,
         variables_a,
         timing_info,
@@ -205,8 +202,16 @@ def main():
 
     # Load data
     path_manager = PathManager(input_dir=input_folder, output_dir=output_folder)
-    stream_dict = load_pickle_as_dict(file_path=path_manager.stream_dict_input_dir)
-    graph_nx = load_graphml(file_path=path_manager.network_graphml_input_dir)
+    streams: List = load_streams_from_csv(path_manager.stream_dict_output_dir)
+    network_graph: nx.graph = load_graphml(path_manager.network_graphml_input_dir)
+    link_config: Dict = load_yaml_file(path_manager.link_config_input_dir)
+    data_factory = DataFactory(
+        link_config=link_config,
+        network_graph=network_graph,
+        raw_streams=streams,
+        k_path_count=3,
+        lcm_rep=1,
+    )
 
     # Copy input files to output directory
     input_folder = os.path.join(data_path, "input")
@@ -235,14 +240,12 @@ def main():
     # Run the optimization with specified batches
     (
         status,
-        variables,
         variables_x,
-        variables_y,
         variables_z,
         variables_a,
         timing_info,
     ) = solve_with_batches(
-        stream_dict=stream_dict,
+        data_factory==data_factory,
         output_path=path_manager.output_dir,
         batches=batches,
         time_limit=60,
@@ -252,10 +255,8 @@ def main():
     save_timing_info(timing_info, output_folder)
 
     # Save results
-    save_as_csv(variables, output_folder, "decision_variables.csv")
-    save_as_pkl(stream_dict, output_folder, "stream_dict.pkl")
+    save_as_pkl(data_factory.stream_dict, output_folder, "stream_dict.pkl")
     save_as_pkl(variables_x, output_folder, "variables_x.pkl")
-    save_as_pkl(variables_y, output_folder, "variables_y.pkl")
     save_as_pkl(variables_z, output_folder, "variables_z.pkl")
     save_as_pkl(variables_a, output_folder, "variables_a.pkl")
 

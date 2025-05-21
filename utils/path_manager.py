@@ -87,11 +87,6 @@ class PathManager:
         return os.path.join(self._output_dir, "variables_x.pkl")
     
     @property
-    def variables_y_dir(self) -> str:
-        """Returns the absolute path to the variables y subdirectory."""
-        return os.path.join(self._output_dir, "variables_y.pkl")
-    
-    @property
     def variables_z_dir(self) -> str:
         """Returns the absolute path to the variables z subdirectory."""
         return os.path.join(self._output_dir, "variables_z.pkl")

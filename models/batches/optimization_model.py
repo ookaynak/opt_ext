@@ -5,13 +5,10 @@ from models.data_factory import DataFactory
 
 class OptimizationModel:
     """
-    Core optimization model that handles the mathematical programming aspects
-    of the stream scheduling problem.
+    OptimizationModel class for scheduling streams in a network.
     """
 
-    def __init__(
-        self, datafactory: DataFactory, output_path: str, time_limit: int = None
-    ):
+    def __init__(self, data_factory: DataFactory, output_path: str, time_limit: int = None):
         """
         Initialize the optimization model.
 
@@ -20,7 +17,7 @@ class OptimizationModel:
             output_path: Directory to store solver outputs
             time_limit: Maximum solver time in seconds
         """
-        self.datafactory = datafactory
+        self.datafactory = data_factory
         self.output_path = output_path
         self.time_limit = time_limit
 
@@ -130,10 +127,104 @@ class OptimizationModel:
         self.add_constraint_4()  # Stream must reach final port
         self.add_constraint_5()  # Periodic repetitions
         # self.add_constraint_5_synced() # Alternative periodic constraint
-        self.add_constraint_6()  # Time limit (LCM)
+        # self.add_constraint_6()  # Time limit (LCM)
         self.add_constraint_7()  # Path selection
         self.add_constraint_8()  # Maximum latency
         self.add_constraint_9()  # Jitter constraint
+
+    def _get_stream_port_timing_params(self, stream, path, port):
+        """Helper to retrieve timing parameters for a stream at a port."""
+        # Ensure previous_port is None if port is the first port, to handle bp.get correctly
+        ports_on_path = self.datafactory.stream_dict[stream][path]["ports"]
+        previous_port_obj = None
+        if port != ports_on_path[0]:  # Check if it's not the first port
+            previous_port_obj = self.datafactory.get_previous_port(stream, path, port)
+
+        bp = self.datafactory.stream_dict[stream][path]["bp"].get(previous_port_obj, 0)
+        proc_time = self.datafactory.get_time_for_stream_port(stream, path, port)
+        dev = self.datafactory.get_deviation_for_stream_port(stream, path, port)
+        gamma = self.datafactory.stream_dict[stream][path]["gamma"].get(port, 1.0)
+
+        processing_duration = proc_time + dev * gamma
+        # effective_length_for_blocking is the total span including buffer period,
+        # relevant for determining if this stream can fit in a gap or how it blocks other streams.
+        effective_length_for_blocking = bp + processing_duration
+
+        return (
+            bp,
+            proc_time,
+            dev,
+            gamma,
+            processing_duration,
+            effective_length_for_blocking,
+        )
+
+    def _get_effective_start_end(
+        self, stream, path, port, scheduled_start_time, add_epsilon_to_end=False
+    ):
+        """Calculates the effective start and end time of a stream transmission at a port."""
+        bp, _, _, _, processing_duration, _ = self._get_stream_port_timing_params(
+            stream, path, port
+        )
+
+        effective_start = scheduled_start_time - bp
+        effective_end = scheduled_start_time + processing_duration
+        if add_epsilon_to_end:
+            effective_end += 1e-9  # Small increment for HD fixed stream end times, per original logic
+        return effective_start, effective_end
+
+    def _merge_time_ranges(
+        self, sorted_effective_occupancies, min_gap_to_fit_item, epsilon=1e-9
+    ):
+        """
+        Merges time ranges representing fixed stream occupancies to find overall blocked periods.
+        A new blocked range is started if the gap between fixed occupancies is large enough
+        to fit an item of size min_gap_to_fit_item.
+
+        Args:
+            sorted_effective_occupancies: List of (effective_start, effective_end) tuples for fixed streams,
+                                          sorted by effective_start.
+            min_gap_to_fit_item: The length of the variable stream we are trying to schedule.
+                                 If a gap between fixed streams is smaller than this,
+                                 the gap is considered part of the blocked range from the perspective
+                                 of the variable stream.
+            epsilon: Small value for floating point comparisons.
+        Returns:
+            List of (block_start, block_duration) tuples.
+        """
+        if not sorted_effective_occupancies:
+            return []
+
+        blocked_ranges = []
+        # The first fixed stream occupancy forms the start of our first potential blocked range
+        current_block_start, current_block_end = sorted_effective_occupancies[0]
+
+        for i in range(1, len(sorted_effective_occupancies)):
+            next_occupancy_start, next_occupancy_end = sorted_effective_occupancies[i]
+
+            gap_between_occupancies = next_occupancy_start - current_block_end
+
+            # If the gap is too small to fit the item, merge the next_occupancy into the current_block.
+            if gap_between_occupancies < min_gap_to_fit_item - epsilon:
+                current_block_end = max(current_block_end, next_occupancy_end)
+            else:
+                # Gap is large enough. Finalize current_block.
+                duration = current_block_end - current_block_start
+                if duration > epsilon:
+                    blocked_ranges.append((current_block_start, duration))
+
+                # The next_occupancy starts a new potential blocked range
+                current_block_start, current_block_end = (
+                    next_occupancy_start,
+                    next_occupancy_end,
+                )
+
+        # Add the last processed/merged block
+        duration = current_block_end - current_block_start
+        if duration > epsilon:
+            blocked_ranges.append((current_block_start, duration))
+
+        return blocked_ranges
 
     def add_constraint_1(self):
         """Add constraints for consecutive port timing within a path"""
@@ -214,7 +305,7 @@ class OptimizationModel:
                         == self.dv_x[(stream, path, repetition, first_port)]
                     )
 
-    #not necessary when max latency <= period and packet_ready_time = 0, with single lcm
+    # not necessary when max latency <= period and packet_ready_time = 0, with single lcm
     def add_constraint_6(self):
         """Time limit constraint (within LCM)"""
         for stream in self.datafactory.stream_dict:
@@ -249,20 +340,21 @@ class OptimizationModel:
                     "repetitions"
                 ]:
                     port = self.datafactory.stream_dict[stream][path]["ports"][-1]
-                    self.prob += (
-                        self.dv_x[(stream, path, repetition, port)]
-                        + (
-                            self.datafactory.get_time_for_stream_port(
-                                stream, path, port
-                            )
-                            + self.datafactory.get_deviation_for_stream_port(
-                                stream, path, port
-                            )
-                            * self.datafactory.stream_dict[stream][path]["gamma"][port]
+                    self.prob += self.dv_x[(stream, path, repetition, port)] + (
+                        self.datafactory.get_time_for_stream_port(stream, path, port)
+                        + self.datafactory.get_deviation_for_stream_port(
+                            stream, path, port
                         )
-                        * self.dv_z[(stream, path)]
-                        <= self.datafactory.stream_dict[stream][path]["max_latency"] +
-                        (self.datafactory.stream_dict[stream][path]["period"] * (repetition - 1))
+                        * self.datafactory.stream_dict[stream][path]["gamma"][port]
+                    ) * self.dv_z[(stream, path)] <= self.datafactory.stream_dict[
+                        stream
+                    ][
+                        path
+                    ][
+                        "max_latency"
+                    ] + (
+                        self.datafactory.stream_dict[stream][path]["period"]
+                        * (repetition - 1)
                     )
 
     def add_constraint_9(self):
@@ -411,56 +503,25 @@ class OptimizationModel:
                                             port,
                                         )
 
-                                        # Calculate processing times and buffer periods
-                                        proc_time_1 = (
-                                            self.datafactory.get_time_for_stream_port(
+                                        bp_1, _, _, _, proc_dur_1, _ = (
+                                            self._get_stream_port_timing_params(
                                                 stream, path, port
                                             )
                                         )
-                                        dev_1 = self.datafactory.get_deviation_for_stream_port(
-                                            stream, path, port
-                                        )
-                                        gamma_1 = self.datafactory.stream_dict[stream][
-                                            path
-                                        ]["gamma"].get(port, 1.0)
-                                        bp_1 = self.datafactory.stream_dict[stream][
-                                            path
-                                        ]["bp"].get(
-                                            self.datafactory.get_previous_port(
-                                                stream, path, port
-                                            ),
-                                            0,
-                                        )
-
-                                        proc_time_2 = (
-                                            self.datafactory.get_time_for_stream_port(
+                                        bp_2, _, _, _, proc_dur_2, _ = (
+                                            self._get_stream_port_timing_params(
                                                 stream_2, path_2, port
                                             )
-                                        )
-                                        dev_2 = self.datafactory.get_deviation_for_stream_port(
-                                            stream_2, path_2, port
-                                        )
-                                        gamma_2 = self.datafactory.stream_dict[
-                                            stream_2
-                                        ][path_2]["gamma"].get(port, 1.0)
-                                        bp_2 = self.datafactory.stream_dict[stream_2][
-                                            path_2
-                                        ]["bp"].get(
-                                            self.datafactory.get_previous_port(
-                                                stream_2, path_2, port
-                                            ),
-                                            0,
                                         )
 
                                         # Constraint 1: stream finishes before stream_2 starts (if yv=1)
-                                        # x1 + (proc1 + dev1*gamma1)*z1 <= x2 - bp2*z2 + M*yv
+                                        # x1 + proc_dur_1*z1 <= x2 - bp2*z2 + M*yv
                                         constraint_name = (
                                             f"var_var_1_{constraint_count}"
                                         )
                                         self.prob.constraints[constraint_name] = (
                                             self.dv_x[(stream, path, repetition, port)]
-                                            + (proc_time_1 + dev_1 * gamma_1)
-                                            * self.dv_z[(stream, path)]
+                                            + proc_dur_1 * self.dv_z[(stream, path)]
                                             <= self.dv_x[
                                                 (
                                                     stream_2,
@@ -477,7 +538,7 @@ class OptimizationModel:
                                         )
 
                                         # Constraint 2: stream_2 finishes before stream starts (if yv=0)
-                                        # x2 + (proc2 + dev2*gamma2)*z2 <= x1 - bp1*z1 + M*(1-yv)
+                                        # x2 + proc_dur_2*z2 <= x1 - bp1*z1 + M*(1-yv)
                                         constraint_name = (
                                             f"var_var_2_{constraint_count}"
                                         )
@@ -490,9 +551,7 @@ class OptimizationModel:
                                                 repetition_2,
                                                 port,
                                             )
-                                        ] + (
-                                            proc_time_2 + dev_2 * gamma_2
-                                        ) * self.dv_z[
+                                        ] + proc_dur_2 * self.dv_z[
                                             (stream_2, path_2)
                                         ] <= self.dv_x[
                                             (stream, path, repetition, port)
@@ -599,53 +658,23 @@ class OptimizationModel:
                             )
 
                             # Calculate relevant times and buffer periods
-                            up_proc_time = self.datafactory.get_time_for_stream_port(
-                                up_stream, up_path, up_port
-                            )
-                            up_deviation = (
-                                self.datafactory.get_deviation_for_stream_port(
+                            up_bp, _, _, _, up_proc_dur, _ = (
+                                self._get_stream_port_timing_params(
                                     up_stream, up_path, up_port
                                 )
                             )
-                            up_gamma = self.datafactory.stream_dict[up_stream][up_path][
-                                "gamma"
-                            ].get(up_port, 1.0)
-                            up_bp = self.datafactory.stream_dict[up_stream][up_path][
-                                "bp"
-                            ].get(
-                                self.datafactory.get_previous_port(
-                                    up_stream, up_path, up_port
-                                ),
-                                0,
-                            )
-
-                            down_proc_time = self.datafactory.get_time_for_stream_port(
-                                down_stream, down_path, down_port
-                            )
-                            down_deviation = (
-                                self.datafactory.get_deviation_for_stream_port(
+                            down_bp, _, _, _, down_proc_dur, _ = (
+                                self._get_stream_port_timing_params(
                                     down_stream, down_path, down_port
                                 )
-                            )
-                            down_gamma = self.datafactory.stream_dict[down_stream][
-                                down_path
-                            ]["gamma"].get(down_port, 1.0)
-                            down_bp = self.datafactory.stream_dict[down_stream][
-                                down_path
-                            ]["bp"].get(
-                                self.datafactory.get_previous_port(
-                                    down_stream, down_path, down_port
-                                ),
-                                0,
                             )
 
                             # Constraint 1: Uplink finishes before Downlink starts (if hdv=1)
-                            # x_up + (proc_up + dev_up*gamma_up)*z_up <= x_down - bp_down*z_down + M*hdv
+                            # x_up + up_proc_dur*z_up <= x_down - down_bp*z_down + M*hdv
                             constraint_name = f"hd_var_var_1_{constraint_count}"
                             self.prob.constraints[constraint_name] = (
                                 self.dv_x[(up_stream, up_path, up_repetition, up_port)]
-                                + (up_proc_time + up_deviation * up_gamma)
-                                * self.dv_z[(up_stream, up_path)]
+                                + up_proc_dur * self.dv_z[(up_stream, up_path)]
                                 <= self.dv_x[
                                     (
                                         down_stream,
@@ -662,7 +691,7 @@ class OptimizationModel:
                             )
 
                             # Constraint 2: Downlink finishes before Uplink starts (if hdv=0)
-                            # x_down + (proc_down + dev_down*gamma_down)*z_down <= x_up - bp_up*z_up + M*(1-hdv)
+                            # x_down + down_proc_dur*z_down <= x_up - up_bp*z_up + M*(1-hdv)
                             constraint_name = f"hd_var_var_2_{constraint_count}"
                             self.prob.constraints[constraint_name] = self.dv_x[
                                 (
@@ -671,9 +700,7 @@ class OptimizationModel:
                                     down_repetition,
                                     down_port,
                                 )
-                            ] + (
-                                down_proc_time + down_deviation * down_gamma
-                            ) * self.dv_z[
+                            ] + down_proc_dur * self.dv_z[
                                 (down_stream, down_path)
                             ] <= self.dv_x[
                                 (up_stream, up_path, up_repetition, up_port)
@@ -711,31 +738,19 @@ class OptimizationModel:
         for var_stream in self.variable_streams:
             for var_path in self.datafactory.stream_dict[var_stream]:
                 for port in self.datafactory.stream_dict[var_stream][var_path]["ports"]:
-                    # Calculate variable length for this stream-path-port combination
-                    variable_bp = self.datafactory.stream_dict[var_stream][var_path][
-                        "bp"
-                    ].get(
-                        self.datafactory.get_previous_port(var_stream, var_path, port),
-                        0,
-                    )
-                    variable_proc_time = self.datafactory.get_time_for_stream_port(
-                        var_stream, var_path, port
-                    )
-                    variable_deviation = self.datafactory.get_deviation_for_stream_port(
-                        var_stream, var_path, port
-                    )
-                    variable_gamma = self.datafactory.stream_dict[var_stream][var_path][
-                        "gamma"
-                    ].get(port, 1.0)
-                    variable_length = (
-                        variable_bp
-                        + variable_proc_time
-                        + variable_deviation * variable_gamma
-                    )
+                    # Calculate variable stream's timing parameters
+                    (
+                        variable_bp,
+                        _,
+                        _,
+                        _,
+                        variable_proc_dur,
+                        variable_effective_length,
+                    ) = self._get_stream_port_timing_params(var_stream, var_path, port)
 
-                    # Get blocked ranges based on the calculated length needed by the variable stream
+                    # Get blocked ranges based on the effective length needed by the variable stream
                     blocked_ranges = self.calculate_blocked_ranges(
-                        port, variable_length
+                        port, variable_effective_length
                     )
 
                     # Skip if no blocked ranges at this port
@@ -766,26 +781,22 @@ class OptimizationModel:
                             block_end = block_start + block_duration
 
                             # Constraint 1: Variable stream finishes before block starts (if yf=0)
-                            # x_var + (proc_var + dev_var*gamma_var)*z_var <= block_start + M * yf
+                            # x_var + variable_proc_dur*z_var <= block_start + M * yf
                             constraint_name = f"var_fixed_before_{constraint_count}"
                             self.prob.constraints[constraint_name] = (
                                 self.dv_x[(var_stream, var_path, repetition, port)]
-                                + (
-                                    variable_proc_time
-                                    + variable_deviation * variable_gamma
-                                )
-                                * self.dv_z[(var_stream, var_path)]
+                                + variable_proc_dur * self.dv_z[(var_stream, var_path)]
                                 <= block_start
                                 + self.datafactory.M * self.dv_yf[block_var_key]
                             )
                             self.variable_fixed_constraints.append(constraint_name)
 
                             # Constraint 2: Variable stream starts after block ends (if yf=1)
-                            # x_var - bp_var*z_var >= block_end - M * (1 - yf)
+                            # x_var - variable_bp*z_var >= block_end - M * (1 - yf)
                             constraint_name = f"var_fixed_after_{constraint_count}"
                             self.prob.constraints[constraint_name] = self.dv_x[
                                 (var_stream, var_path, repetition, port)
-                            ] - variable_bp * self.dv_z[
+                            ] - variable_bp * self.dv_z[  # Use variable_bp here
                                 (var_stream, var_path)
                             ] >= block_end - self.datafactory.M * (
                                 1 - self.dv_yf[block_var_key]
@@ -905,29 +916,16 @@ class OptimizationModel:
 
                         # Only proceed if there are fixed streams in the opposite direction
                         if fixed_schedule_tuples:
-                            # Calculate the effective length needed by the variable stream at this port
-                            var_bp = self.datafactory.stream_dict[var_stream][var_path][
-                                "bp"
-                            ].get(
-                                self.datafactory.get_previous_port(
+                            # Calculate timing parameters for the variable stream
+                            var_bp, _, _, _, var_proc_dur, var_effective_length = (
+                                self._get_stream_port_timing_params(
                                     var_stream, var_path, var_port
-                                ),
-                                0,
+                                )
                             )
-                            var_proc = self.datafactory.get_time_for_stream_port(
-                                var_stream, var_path, var_port
-                            )
-                            var_dev = self.datafactory.get_deviation_for_stream_port(
-                                var_stream, var_path, var_port
-                            )
-                            var_gamma = self.datafactory.stream_dict[var_stream][
-                                var_path
-                            ]["gamma"].get(var_port, 1.0)
-                            variable_length = var_bp + var_proc + var_dev * var_gamma
 
                             # Calculate blocked ranges caused by the fixed streams in the opposite direction
                             blocked_ranges = self.calculate_blocked_ranges_hd(
-                                fixed_schedule_tuples, variable_length
+                                fixed_schedule_tuples, var_effective_length
                             )
 
                             if not blocked_ranges:
@@ -976,7 +974,7 @@ class OptimizationModel:
                                                 var_port,
                                             )
                                         ]
-                                        + (var_proc + var_dev * var_gamma)
+                                        + var_proc_dur
                                         * self.dv_z[(var_stream, var_path)]
                                         <= block_start
                                         + self.datafactory.M
@@ -987,13 +985,13 @@ class OptimizationModel:
                                     )
 
                                     # Constraint 2: Variable stream starts after Fixed block ends (if hdf=1)
-                                    # x_var - bp_var*z_var >= block_end - M * (1 - hdf)
+                                    # x_var - var_bp*z_var >= block_end - M * (1 - hdf)
                                     constraint_name = (
                                         f"hd_var_fixed_after_{constraint_count}"
                                     )
                                     self.prob.constraints[constraint_name] = self.dv_x[
                                         (var_stream, var_path, var_repetition, var_port)
-                                    ] - var_bp * self.dv_z[
+                                    ] - var_bp * self.dv_z[  # Use var_bp here
                                         (var_stream, var_path)
                                     ] >= block_end - self.datafactory.M * (
                                         1 - self.dv_hdf[block_var_key]
@@ -1208,21 +1206,6 @@ class OptimizationModel:
             if var.value() is not None
         }
 
-        # Extract y variables (ordering) - only non-None
-        variables_y = {}
-        for key, var in self.dv_yv.items():
-            if var.value() is not None:
-                variables_y[key] = var.value()
-        for key, var in self.dv_yf.items():
-            if var.value() is not None:
-                variables_y[key] = var.value()
-        for key, var in self.dv_hdv.items():
-            if var.value() is not None:
-                variables_y[key] = var.value()
-        for key, var in self.dv_hdf.items():
-            if var.value() is not None:
-                variables_y[key] = var.value()
-
         # Extract z variables (path selection) - cleaned to 0 or 1
         variables_z = {}
         for stream in self.datafactory.stream_dict:
@@ -1240,7 +1223,7 @@ class OptimizationModel:
             val = a_var.value() if a_var else None
             variables_a[stream] = 1 if val is not None and val > 0.5 else 0
 
-        return variables_raw, variables_x, variables_y, variables_z, variables_a
+        return variables_x, variables_z, variables_a
 
     def solve(self, iteration=None):
         """
@@ -1260,21 +1243,9 @@ class OptimizationModel:
             lp_file_path = os.path.join(
                 self.output_path, f"model_iteration_{iteration}.lp"
             )
-            # Uncomment to write LP file for debugging specific iterations
-            # try:
-            #     self.prob.writeLP(lp_file_path)
-            #     print(f"Exported LP model for iteration {iteration} to {lp_file_path}")
-            # except Exception as e:
-            #     print(f"Error writing LP file for iteration {iteration}: {e}")
         else:
             log_file_path = os.path.join(self.output_path, "solver_log.log")
             lp_file_path = os.path.join(self.output_path, "model.lp")
-            # Uncomment to write the final LP file
-            # try:
-            #     self.prob.writeLP(lp_file_path)
-            #     print(f"Exported LP model to {lp_file_path}")
-            # except Exception as e:
-            #     print(f"Error writing LP file: {e}")
 
         # Update the solver with the potentially new log file path
         self.solver = pulp.GUROBI(
@@ -1335,174 +1306,39 @@ class OptimizationModel:
 
         return scheduled_times
 
-    def print_fixed_port_schedule(self, port):
-        """
-        Print the schedule of fixed streams at a specific port in a nice format.
-
-        Args:
-            port: The port identifier (e.g., ('0-SW1', '0-SW2'))
-        """
-        schedule = self.get_fixed_stream_port_schedule(port)
-
-        if not schedule:
-            print(f"\nNo fixed streams scheduled at port {port}")
-            return
-
-        print(f"\n=== Fixed Stream Schedule for Port {port} ===")
-        print(
-            f"{'Stream':<7} {'Path':<6} {'Repetition':<10} {'Start':<10} {'Duration':<10} {'End':<10}"
-        )
-        print("-" * 60)
-
-        schedule_details = []  # Store details for timeline
-        for start_time, stream, path, repetition, port_used in schedule:
-            # Calculate buffering period for this stream at this port
-            bp = self.datafactory.stream_dict[stream][path]["bp"].get(
-                self.datafactory.get_previous_port(stream, path, port_used), 0
-            )
-
-            # Calculate processing time (including deviation)
-            proc_time = self.datafactory.get_time_for_stream_port(
-                stream, path, port_used
-            )
-            dev = self.datafactory.get_deviation_for_stream_port(
-                stream, path, port_used
-            )
-            gamma = self.datafactory.stream_dict[stream][path]["gamma"].get(
-                port_used, 1.0
-            )
-            total_proc_time = proc_time + dev * gamma
-
-            # Calculate effective start and end times including buffer
-            effective_start = start_time - bp
-            effective_end = start_time + total_proc_time
-            effective_duration = effective_end - effective_start
-
-            schedule_details.append(
-                (effective_start, effective_end, stream, repetition)
-            )
-
-            # Print the details
-            print(
-                f"{stream:<7} {path:<6} {repetition:<10} {effective_start:<10.2f} {effective_duration:<10.2f} {effective_end:<10.2f}"
-            )
-
-        # Add a simple timeline visualization
-        print("\nTimeline (Effective Start/End including Buffering):")
-        if schedule_details:
-            # Find max effective end time
-            max_time = 0
-            for eff_start, eff_end, _, _ in schedule_details:
-                max_time = max(max_time, eff_end)
-
-            timeline_width = 60
-            scale = (
-                timeline_width / max_time if max_time > 1e-9 else 1
-            )  # Avoid division by zero
-
-            print("0" + " " * (timeline_width - 1) + f"{max_time:.1f}")
-            print("|" + "-" * (timeline_width) + "|")  # Adjusted width
-
-            # Sort by effective start time for printing timeline
-            schedule_details.sort()
-
-            for effective_start, effective_end, stream, repetition in schedule_details:
-                start_pos = int(effective_start * scale)
-                end_pos = int(effective_end * scale)
-
-                # Ensure positions are within bounds and length is at least 1
-                start_pos = max(0, min(start_pos, timeline_width))
-                end_pos = max(
-                    start_pos, min(end_pos, timeline_width + 1)
-                )  # Ensure end >= start
-                length = max(
-                    1, end_pos - start_pos
-                )  # Ensure length is at least 1 if end > start
-
-                line = " " * start_pos + "#" * length
-                line = line.ljust(timeline_width + 1)  # Pad to full width
-
-                print(f"{line} Stream {stream}, Rep {repetition}")
-
-    def calculate_blocked_ranges(self, port, variable_length):
+    def calculate_blocked_ranges(self, port, variable_effective_length):
         """
         Calculate blocked time ranges at a specific port based on fixed streams using that port.
 
-        A blocked range is a time interval where a variable stream of length `variable_length`
-        cannot be scheduled without overlapping a fixed stream or fitting into a gap smaller than `variable_length`.
+        A blocked range is a time interval where a variable stream of `variable_effective_length`
+        cannot be scheduled without overlapping a fixed stream or fitting into a gap smaller
+        than `variable_effective_length`.
 
         Args:
             port: The port identifier tuple (e.g., ('0-SW1', '0-SW2'))
-            variable_length: The total effective length needed for the variable stream
-                             (buffering + processing + deviation*gamma).
-
+            variable_effective_length: The total effective length (including its own buffer period)
+                                       needed for the variable stream. This is used as `min_gap_to_fit_item`.
         Returns:
-            List of tuples: [(start_time, duration), ...] for each blocked range, sorted by start time.
+            List of tuples: [(start_time, duration), ...] for each blocked range.
         """
-        # Get all fixed streams scheduled at this port
         fixed_schedule_at_port = self.get_fixed_stream_port_schedule(port)
-
         if not fixed_schedule_at_port:
-            return []  # No fixed streams, so no blocked ranges
+            return []
 
-        # Create expanded schedule with each fixed stream's effective start and end times
-        expanded_schedule = []
+        effective_occupancies = []
         for start_time, stream, path, rep, port_used in fixed_schedule_at_port:
-            # Calculate buffering time for this fixed stream
-            bp = self.datafactory.stream_dict[stream][path]["bp"].get(
-                self.datafactory.get_previous_port(stream, path, port_used), 0
+            eff_start, eff_end = self._get_effective_start_end(
+                stream, path, port_used, start_time
             )
+            effective_occupancies.append((eff_start, eff_end))
 
-            # Calculate processing time (including deviation)
-            proc_time = self.datafactory.get_time_for_stream_port(
-                stream, path, port_used
-            )
-            dev = self.datafactory.get_deviation_for_stream_port(
-                stream, path, port_used
-            )
-            gamma = self.datafactory.stream_dict[stream][path]["gamma"].get(
-                port_used, 1.0
-            )
-            total_proc_time = proc_time + dev * gamma
+        effective_occupancies.sort()  # Sort by effective start time
 
-            # Effective start and end times including buffer
-            effective_start = start_time - bp
-            effective_end = start_time + total_proc_time
+        return self._merge_time_ranges(effective_occupancies, variable_effective_length)
 
-            expanded_schedule.append((effective_start, effective_end))
-
-        # Sort by effective start time
-        expanded_schedule.sort()
-
-        # Merge overlapping or close ranges based on variable_length
-        if not expanded_schedule:
-            return []  # Should not happen if fixed_schedule_at_port was not empty
-
-        blocked_ranges = []
-        current_start, current_end = expanded_schedule[0]
-
-        for next_start, next_end in expanded_schedule[1:]:
-            gap_size = next_start - current_end
-
-            # Check if the gap is smaller than the length needed by the variable stream (with tolerance)
-            if gap_size < variable_length - 1e-9:  # Use epsilon
-                # Gap is too small, merge this block with the current one
-                current_end = max(current_end, next_end)
-            else:
-                # Gap is large enough, finish the current blocked range and start a new one
-                duration = current_end - current_start
-                if duration > 1e-9:  # Avoid zero-duration blocks (use epsilon)
-                    blocked_ranges.append((current_start, duration))
-                current_start, current_end = next_start, next_end
-
-        # Add the final blocked range
-        duration = current_end - current_start
-        if duration > 1e-9:  # Use epsilon
-            blocked_ranges.append((current_start, duration))
-
-        return blocked_ranges
-
-    def calculate_blocked_ranges_hd(self, fixed_schedule_tuples, variable_length):
+    def calculate_blocked_ranges_hd(
+        self, fixed_schedule_tuples, variable_effective_length
+    ):
         """
         Helper to calculate blocked ranges specifically for half-duplex constraints.
         Takes a list of tuples representing the schedule of fixed streams in one direction.
@@ -1510,84 +1346,22 @@ class OptimizationModel:
         Args:
             fixed_schedule_tuples: List of (start_time, stream, path, rep, port_used)
                                    for fixed streams using the device in the *opposite* direction.
-            variable_length: The total effective length needed for the variable stream
-                             (buffering + processing + deviation*gamma).
-
+            variable_effective_length: The total effective length (including its own buffer period)
+                                       needed for the variable stream. This is used as `min_gap_to_fit_item`.
         Returns:
             List of tuples: [(start_time, duration), ...] for each blocked range.
         """
         if not fixed_schedule_tuples:
             return []
 
-        # Create expanded schedule with effective start/end times for fixed streams
-        expanded_schedule = []
+        effective_occupancies = []
         for start_time, stream, path, rep, port_used in fixed_schedule_tuples:
-            # Use .get with default 0 for safety
-            bp = self.datafactory.stream_dict[stream][path]["bp"].get(
-                self.datafactory.get_previous_port(stream, path, port_used), 0
+            # For HD, a small epsilon is added to the end of fixed stream occupancy, as per original logic
+            eff_start, eff_end = self._get_effective_start_end(
+                stream, path, port_used, start_time, add_epsilon_to_end=True
             )
-            proc_time = self.datafactory.get_time_for_stream_port(
-                stream, path, port_used
-            )
-            dev = self.datafactory.get_deviation_for_stream_port(
-                stream, path, port_used
-            )
-            # Use .get with default 1.0 for safety
-            gamma = self.datafactory.stream_dict[stream][path]["gamma"].get(
-                port_used, 1.0
-            )
-            total_proc_time = proc_time + dev * gamma
-            effective_start = start_time - bp
-            effective_end = start_time + total_proc_time
-            # Add a small buffer to the end time to prevent edge cases with floating point numbers
-            # This ensures that if a variable stream starts *exactly* at the effective_end, it's allowed.
-            # The merging logic handles cases where the gap is truly too small.
-            expanded_schedule.append(
-                (effective_start, effective_end + 1e-9)
-            )  # Add epsilon to end
+            effective_occupancies.append((eff_start, eff_end))
 
-        # Sort by effective start time
-        expanded_schedule.sort()
+        effective_occupancies.sort()  # Sort by effective start time
 
-        # Merge overlapping or close ranges based on variable_length
-        if not expanded_schedule:
-            return []  # Should not happen if fixed_schedule_tuples was not empty
-
-        blocked_ranges = []
-        # Handle the case of a single fixed stream
-        if len(expanded_schedule) == 1:
-            current_start, current_end = expanded_schedule[0]
-            duration = current_end - current_start
-            if duration > 1e-9:  # Use epsilon
-                blocked_ranges.append((current_start, duration))
-            return blocked_ranges
-
-        # Process multiple fixed streams
-        current_start, current_end = expanded_schedule[0]
-
-        for next_start, next_end in expanded_schedule[1:]:
-            gap_size = next_start - current_end
-
-            # Check if the gap is smaller than the length needed by the variable stream (with tolerance)
-            # If gap_size < variable_length, the variable stream cannot fit in the gap.
-            if gap_size < variable_length - 1e-9:  # Use epsilon for comparison
-                # Gap is too small, merge this block with the current one by extending the end time
-                current_end = max(current_end, next_end)
-            else:
-                # Gap is large enough. Finalize the current blocked range (if significant)
-                # and start a new one.
-                duration = current_end - current_start
-                if duration > 1e-9:  # Avoid zero-duration blocks (use epsilon)
-                    blocked_ranges.append((current_start, duration))
-                # Start the new blocked range
-                current_start, current_end = next_start, next_end
-
-        # Add the final blocked range after the loop finishes
-        duration = current_end - current_start
-        if duration > 1e-9:  # Use epsilon
-            blocked_ranges.append((current_start, duration))
-
-        return blocked_ranges
-
-
-# End of OptimizationModel class
+        return self._merge_time_ranges(effective_occupancies, variable_effective_length)

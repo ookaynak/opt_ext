@@ -10,11 +10,13 @@ from functools import reduce
 from collections import defaultdict
 from matplotlib.patches import Rectangle  # Import Rectangle for legend
 from utils.path_manager import PathManager
+from utils import helper
 import yaml
 import warnings
 
 # Suppress specific warnings if needed (e.g., Matplotlib future warnings)
 warnings.filterwarnings("ignore", category=FutureWarning)
+
 
 class OutputManager:
     """
@@ -25,11 +27,7 @@ class OutputManager:
     # Use type hints for better readability and maintainability
     def __init__(self, path_manager: PathManager):
         self.path_manager = path_manager
-        self.variables_df: pd.DataFrame | None = None
         self.variables_x: dict | None = None  # {(stream, path, rep, port): open_time}
-        self.variables_y: dict | None = (
-            None  # {(stream, path, rep, port): close_time} - Often redundant if duration is known
-        )
         self.variables_z: dict | None = (
             None  # {(stream, path): 1 if scheduled, 0 otherwise}
         )
@@ -68,130 +66,15 @@ class OutputManager:
                 f"ERROR: Could not create processed results directory {self.processed_results_dir}: {e}"
             )
 
-    def _load_pickle(self, file_path: str, description: str) -> dict | None:
-        """Helper to load a pickle file with error handling."""
-        if not file_path or not isinstance(file_path, str):
-            print(f"ERROR: Invalid file path provided for {description}: {file_path}")
-            return None
-        try:
-            with open(file_path, "rb") as f:
-                data = pickle.load(f)
-            print(f"Loaded {description} (pickle) successfully from {file_path}.")
-            return data
-        except FileNotFoundError:
-            print(f"ERROR: Pickle file not found: {file_path}")
-            return None
-        except (pickle.UnpicklingError, EOFError) as e:
-            print(f"ERROR: Failed to unpickle {description} from {file_path}: {e}")
-            return None
-        except Exception as e:
-            print(
-                f"ERROR: Unexpected error loading {description} (pickle) from {file_path}: {e}"
-            )
-            return None
-
-    def _load_yaml(self, file_path: str, description: str) -> dict | None:
-        """Helper to load a YAML file with error handling."""
-        if not file_path or not isinstance(file_path, str):
-            print(f"ERROR: Invalid file path provided for {description}: {file_path}")
-            return None
-        try:
-            with open(file_path, "r") as f:
-                data = yaml.safe_load(f)
-            print(f"Loaded {description} (YAML) successfully from {file_path}.")
-            # Basic validation: Check if it's a dictionary
-            if not isinstance(data, dict):
-                print(
-                    f"WARNING: Loaded {description} from {file_path} is not a dictionary (type: {type(data)})."
-                )
-                # Return None or handle as appropriate for your use case
-                # return None
-            return data
-        except FileNotFoundError:
-            print(f"ERROR: YAML file not found: {file_path}")
-            return None
-        except yaml.YAMLError as e:
-            print(f"ERROR: Error parsing YAML file {file_path}: {e}")
-            return None
-        except Exception as e:
-            print(
-                f"ERROR: Unexpected error loading {description} (YAML) from {file_path}: {e}"
-            )
-            return None
-
-    def _save_dataframe_as_csv(
-        self,
-        df: pd.DataFrame | None,
-        filename: str,
-        description: str,
-        index=True,
-        float_format="%.6f",
-    ):
-        """Helper to save a DataFrame as CSV."""
-        if df is not None:
-            csv_path = os.path.join(self.processed_results_dir, filename)
-            try:
-                df.to_csv(csv_path, index=index, float_format=float_format)
-                print(f"Saved {description} as CSV at {csv_path}")
-            except Exception as e:
-                print(f"ERROR: Error saving {description} to CSV {csv_path}: {e}")
-        else:
-            print(f"Skipping CSV save for {description} as DataFrame is None.")
-
-    def _save_dict_as_csv(
-        self,
-        data: dict | None,
-        filename: str,
-        description: str,
-        index_label="key",
-        value_label="value",
-    ):
-        """Helper to save a simple dictionary (key-value) or nested dict as CSV."""
-        if data is not None:
-            csv_path = os.path.join(self.processed_results_dir, filename)
-            try:
-                # Attempt to convert dict to DataFrame intelligently
-                try:
-                    # Handles dicts like {key: scalar} or {key: {col1: val1, col2: val2}}
-                    df = pd.DataFrame.from_dict(data, orient="index")
-                    if df.shape[1] == 1:  # If it resulted in a single column DataFrame
-                        df.columns = [value_label]
-                    df.index.name = index_label
-                except ValueError:
-                    # Fallback for simple {key: scalar} if from_dict fails
-                    df = pd.Series(data).reset_index()
-                    df.columns = [index_label, value_label]
-
-                self._save_dataframe_as_csv(
-                    df, filename, description, index=False
-                )  # Save derived DataFrame
-            except Exception as e:
-                print(
-                    f"ERROR: Error converting/saving {description} dict to CSV {csv_path}: {e}"
-                )
-        else:
-            print(f"Skipping CSV save for {description} as data is None.")
-
     def load_files(self):
         """Loads all necessary input and output files from the simulation/optimization."""
         print("--- Loading Input Files ---")
 
         # Load primary results (pickle files)
-        self.stream_dict = self._load_pickle(
-            self.path_manager.stream_dict_output_dir, "stream_dict"
-        )
-        self.variables_x = self._load_pickle(
-            self.path_manager.variables_x_dir, "variables_x"
-        )
-        self.variables_y = self._load_pickle(
-            self.path_manager.variables_y_dir, "variables_y"
-        )
-        self.variables_z = self._load_pickle(
-            self.path_manager.variables_z_dir, "variables_z"
-        )
-        self.variables_a = self._load_pickle(
-            self.path_manager.variables_a_dir, "variables_a"
-        )
+        self.stream_dict = helper.load_pickle(self.path_manager.stream_dict_output_dir)
+        self.variables_x = helper.load_pickle(self.path_manager.variables_x_dir)
+        self.variables_z = helper.load_pickle(self.path_manager.variables_z_dir)
+        self.variables_a = helper.load_pickle(self.path_manager.variables_a_dir)
 
         # Load topology graph
         try:
@@ -217,27 +100,22 @@ class OutputManager:
 
         # Load histogram config (try output path first, then input path)
         self.histogram_config = None
-        histogram_output_path = self.path_manager.histogram_config_output_dir
-        histogram_input_path = self.path_manager.histogram_config_input_dir
 
-        if histogram_output_path:
+        if self.path_manager.histogram_config_output_dir:
             print(
-                f"Attempting to load histogram config from output path: {histogram_output_path}"
+                f"Attempting to load histogram config from output path: {self.path_manager.histogram_config_output_dir}"
             )
-            self.histogram_config = self._load_yaml(
-                histogram_output_path, "histogram_config (output)"
+            self.histogram_config = helper.load_yaml_file(
+                self.path_manager.histogram_config_output_dir
             )
 
-        if self.histogram_config is None and histogram_input_path:
+        if self.path_manager.histogram_config_input_dir:
             print(
-                f"Info: Could not load histogram config from output path. Trying input path: {histogram_input_path}"
+                f"Attempting to load histogram config from input path: {self.path_manager.histogram_config_input_dir}"
             )
-            self.histogram_config = self._load_yaml(
-                histogram_input_path, "histogram_config (input)"
+            self.histogram_config = helper.load_yaml_file(
+                self.path_manager.histogram_config_input_dir
             )
-
-        if self.histogram_config is None:
-            print("WARNING: Histogram config could not be loaded from any path.")
 
         print("--- File Loading Complete ---")
 
@@ -352,33 +230,6 @@ class OutputManager:
         print("--- Common Data Preparation Complete ---")
         return True
 
-    def save_intermediate_csvs(self):
-        """Saves intermediate variable dictionaries (X, A, Z) as CSV files."""
-        print("--- Saving Intermediate Variables as CSV ---")
-        # Note: variables_x can be very large, saving might be slow/memory intensive
-        self._save_dict_as_csv(
-            self.variables_x,
-            "variables_x.csv",
-            "variables_x",
-            index_label="stream_path_rep_port",
-            value_label="open_time",
-        )
-        self._save_dict_as_csv(
-            self.variables_a,
-            "variables_a.csv",
-            "variables_a",
-            index_label="stream",
-            value_label="scheduled_flag",
-        )
-        self._save_dict_as_csv(
-            self.variables_z,
-            "variables_z.csv",
-            "variables_z",
-            index_label="stream_path",
-            value_label="scheduled_flag",
-        )
-        print("--- Intermediate CSV Saving Complete ---")
-
     @staticmethod
     def _calculate_lcm_from_list(numbers: list[int]) -> int:
         """Calculates the least common multiple (LCM) of a list of positive integers."""
@@ -422,7 +273,7 @@ class OutputManager:
         Returns:
             float: The calculated miss probability (0.0 to 1.0). Returns 0.0 if data is missing.
         """
-        
+
         packet_size_str = str(packet_size)  # YAML keys are typically strings
 
         try:
@@ -484,7 +335,7 @@ class OutputManager:
             )
             return {}
 
-        stream_success_probabilities = {} # Renamed variable
+        stream_success_probabilities = {}  # Renamed variable
 
         for stream_id, path_id in self.activated_streams_list:
             try:
@@ -510,7 +361,9 @@ class OutputManager:
                         print(
                             f"Warning: Cannot find 'size' or 'packet_size' for stream {stream_id}. Skipping success probability calculation."
                         )
-                        stream_success_probabilities[stream_id] = 1.0 # Default to success if size missing
+                        stream_success_probabilities[stream_id] = (
+                            1.0  # Default to success if size missing
+                        )
                         continue
 
                 try:
@@ -519,16 +372,17 @@ class OutputManager:
                     print(
                         f"Warning: Invalid packet size '{packet_size}' for stream {stream_id}. Skipping success probability calculation."
                     )
-                    stream_success_probabilities[stream_id] = 1.0 # Default to success if size invalid
+                    stream_success_probabilities[stream_id] = (
+                        1.0  # Default to success if size invalid
+                    )
                     continue
 
                 link_success_probabilities = []
 
                 for port in stream_ports:
                     sender, receiver = port
-                    is_wireless_link = (
-                        ("WED" in sender and "WN" in receiver) or
-                        ("WN" in sender and "WED" in receiver)
+                    is_wireless_link = ("WED" in sender and "WN" in receiver) or (
+                        "WN" in sender and "WED" in receiver
                     )
                     deviation = sum(stream_devs.get(port, {}).values())
 
@@ -559,13 +413,17 @@ class OutputManager:
                 # --- Calculate overall stream success probability ---
                 # Probability of *all* wireless links succeeding
                 overall_success_prob = 1.0
-                if link_success_probabilities: # Only calculate if there were wireless links
+                if (
+                    link_success_probabilities
+                ):  # Only calculate if there were wireless links
                     for success_prob in link_success_probabilities:
                         overall_success_prob *= success_prob
                 # If no wireless links, success probability remains 1.0
 
                 # Store the overall success probability directly
-                stream_success_probabilities[stream_id] = overall_success_prob # Changed this line
+                stream_success_probabilities[stream_id] = (
+                    overall_success_prob  # Changed this line
+                )
 
             except Exception as e:
                 print(
@@ -576,7 +434,7 @@ class OutputManager:
                 )
 
         print("--- Stream Success Probability Calculation Complete ---")
-        return stream_success_probabilities # Return the success probabilities
+        return stream_success_probabilities  # Return the success probabilities
 
     def _add_text_label(
         self, ax, stream_id, start, duration, y_pos, num_ports, is_blocked=False
@@ -1170,10 +1028,6 @@ class OutputManager:
                         normalized_arrivals[0] + period
                     ) - normalized_arrivals[-1]
                     max_diff = max(max_diff, wraparound_diff)
-
-                    # Jitter is often defined as max - min normalized arrival difference,
-                    # but max difference between any pair considering wraparound is also common.
-                    # Let's use the range (max_norm - min_norm) considering wraparound.
                     min_norm = normalized_arrivals[0]
                     max_norm = normalized_arrivals[-1]
                     direct_range = max_norm - min_norm
@@ -1207,10 +1061,10 @@ class OutputManager:
             return None
 
         jitter_df = pd.DataFrame.from_dict(jitter_metrics, orient="index")
-        self._save_dataframe_as_csv(
+        helper.save_dataframe_as_csv(  # Updated call
             jitter_df,
+            self.processed_results_dir,
             "jitter_metrics.csv",
-            "Jitter Metrics",
             index=False,
             float_format="%.6f",
         )
@@ -1375,9 +1229,7 @@ class OutputManager:
         # Configure axes and labels
         ax.set_xlim(0, self.lcm_period)
         ax.set_ylim(-0.5, num_ports - 0.5)
-        ax.set_xlabel(
-            f"Time", fontsize=label_fontsize
-        )
+        ax.set_xlabel(f"Time", fontsize=label_fontsize)
         ax.set_ylabel("Port Gates", fontsize=label_fontsize)
         ax.set_yticks(range(num_ports))
         ax.set_yticklabels(sorted_ports, fontsize=ytick_fontsize)
@@ -1709,10 +1561,10 @@ class OutputManager:
         ] + [overall_averages.get("non_utilizable", np.nan)]
 
         avg_summary_df = pd.DataFrame(summary_data)
-        self._save_dataframe_as_csv(
+        helper.save_dataframe_as_csv(  # Updated call
             avg_summary_df,
+            self.processed_results_dir,
             f"utilization_summary_{min_blank_size}.csv",
-            "Utilization Summary",
             index=False,
             float_format="%.2f",
         )
@@ -1861,21 +1713,21 @@ class OutputManager:
         )
 
         # --- Save matrices as CSV ---
-        self._save_dataframe_as_csv(
-            utilization_df, "link_utilization_matrix.csv", "Utilization Matrix"
+        helper.save_dataframe_as_csv(  # Updated call
+            utilization_df, self.processed_results_dir, "link_utilization_matrix.csv"
         )
-        self._save_dataframe_as_csv(
-            blocked_df, "blocked_periods_matrix.csv", "Blocked Periods Matrix"
+        helper.save_dataframe_as_csv(  # Updated call
+            blocked_df, self.processed_results_dir, "blocked_periods_matrix.csv"
         )
-        self._save_dataframe_as_csv(
+        helper.save_dataframe_as_csv(  # Updated call
             utilizable_df,
+            self.processed_results_dir,
             f"utilizable_free_space_{min_blank_size}_matrix.csv",
-            "Utilizable Free Space Matrix",
         )
-        self._save_dataframe_as_csv(
+        helper.save_dataframe_as_csv(  # Updated call
             non_utilizable_df,
+            self.processed_results_dir,
             f"non_utilizable_free_space_{min_blank_size}_matrix.csv",
-            "Non-Utilizable Free Space Matrix",
         )
 
         print("--- Utilization Heatmap Generation Complete ---")
@@ -1941,55 +1793,64 @@ class OutputManager:
             print("WARNING: 'scheduled' column not added. Setting to default 0.")
             streams_with_updates["scheduled"] = 0
 
-
         # --- Calculate and add 'success_probability' column --- # Renamed column
-        success_prob_col_added = False # Renamed variable
+        success_prob_col_added = False  # Renamed variable
         if self.histogram_config is not None:
             # Call the renamed method
-            success_probabilities = self.calculate_success_probabilities() # Renamed method call
-            if success_probabilities: # Check if the dictionary is not empty
+            success_probabilities = (
+                self.calculate_success_probabilities()
+            )  # Renamed method call
+            if success_probabilities:  # Check if the dictionary is not empty
                 prob_series = pd.Series(success_probabilities, dtype=float)
                 try:
                     # Map using index
-                    streams_with_updates["success_probability"] = ( # Renamed column
+                    streams_with_updates["success_probability"] = (  # Renamed column
                         streams_with_updates.index.map(prob_series)
                     )
                 except TypeError:
                     try:
                         # Try converting index if needed
-                        streams_with_updates["success_probability"] = ( # Renamed column
-                            streams_with_updates.index.astype(int).map(prob_series)
+                        streams_with_updates["success_probability"] = (
+                            streams_with_updates.index.astype(  # Renamed column
+                                int
+                            ).map(prob_series)
                         )
                     except Exception as e_map_prob:
                         print(
                             f"ERROR: Failed to map success probabilities using index: {e_map_prob}. Setting 'success_probability' to 1.0."
                         )
-                        streams_with_updates["success_probability"] = 1.0 # Default to success
+                        streams_with_updates["success_probability"] = (
+                            1.0  # Default to success
+                        )
 
                 # Fill NaN values (e.g., unscheduled streams) with 1.0 (success)
                 streams_with_updates["success_probability"] = streams_with_updates[
-                    "success_probability" # Renamed column
+                    "success_probability"  # Renamed column
                 ].fillna(1.0)
-                print("Added 'success_probability' column.") # Updated message
-                success_prob_col_added = True # Renamed variable
+                print("Added 'success_probability' column.")  # Updated message
+                success_prob_col_added = True  # Renamed variable
             else:
-                print("WARNING: Success probability calculation returned empty results.")
+                print(
+                    "WARNING: Success probability calculation returned empty results."
+                )
         else:
             print(
                 "WARNING: Histogram config not loaded. Skipping success probability calculation."
             )
 
-        if not success_prob_col_added: # Renamed variable
+        if not success_prob_col_added:  # Renamed variable
             print(
-                "WARNING: 'success_probability' column not added. Setting to default 1.0." # Updated message
+                "WARNING: 'success_probability' column not added. Setting to default 1.0."  # Updated message
             )
-            streams_with_updates["success_probability"] = 1.0 # Renamed column, default to success
+            streams_with_updates["success_probability"] = (
+                1.0  # Renamed column, default to success
+            )
 
         # --- Save the updated streams CSV ---
-        self._save_dataframe_as_csv(
+        helper.save_dataframe_as_csv(  # Updated call
             streams_with_updates,
+            self.processed_results_dir,
             "streams_updated.csv",
-            "Updated Streams",
             index=True,
             float_format="%.6g",
         )
@@ -2011,9 +1872,6 @@ class OutputManager:
                 "ERROR: Halting processing due to errors during common data preparation."
             )
             return
-
-        # Save intermediate results (optional, can be large)
-        # self.save_intermediate_csvs() # Uncomment if needed
 
         # Generate scheduling charts
         self.draw_scheduling_chart(highlight_stream_index)

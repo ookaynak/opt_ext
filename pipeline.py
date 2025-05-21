@@ -1,23 +1,24 @@
+from models.data_factory import DataFactory
 from models.output_generator import OutputManager
-from stream_dictionary_creator.stream_dict_creator import StreamDictCreator
 from utils.helper import (
     load_graphml,
-    load_pickle_as_dict,
-    save_as_csv,
+    load_streams_from_csv,
+    load_yaml_file,
     save_as_graphml,
     save_as_pkl,
 )
 from utils.path_manager import PathManager
 from models.batches.main import solve_with_batches, save_timing_info
-from utils.memory_tracker import MemoryTracker  # Import the memory tracker
+from utils.memory_tracker import MemoryTracker  
 
 import os
 import uuid
 import shutil
 import argparse
-import time
 from datetime import datetime
 import traceback
+from typing import List, Dict
+import networkx as nx
 
 
 def parse_args():
@@ -30,76 +31,75 @@ def parse_args():
     parser.add_argument('--config', type=str, help='Path to config file',
                        default=None)  # Will try input_dir/link_config.yaml by default
     parser.add_argument('--streams', type=int, help='Number of streams to process',
-                       default=280)
+                       default=20)
     parser.add_argument('--batch-size', type=int, help='Batch size for processing',
                        default=10)
     parser.add_argument('--time-limit', type=int, help='Time limit for solver in seconds',
-                       default=100)
+                       default=60)
     parser.add_argument('--k-paths', type=int, help='Number of paths per stream',
                        default=3)
     parser.add_argument('--highlight', type=int, help='Stream ID to highlight',
-                       default=None)  # Default to stream 5, which should be scheduled
+                       default=None)
     parser.add_argument('--memory-interval', type=int, help='Memory sampling interval in seconds',
                        default=5)
     return parser.parse_args()
 
 
-def create_batches(total_count, batch_size):
-    """Create batches for optimization"""
+def create_batches(stream_ids, batch_size):
+    """Create batches for optimization from a list of stream IDs"""
     batches = []
-    start = 0
-    while start < total_count:
-        end = min(start + batch_size, total_count)
-        batches.append([x for x in range(start, end)])
-        start = end
+    for i in range(0, len(stream_ids), batch_size):
+        batch = stream_ids[i:i + batch_size]
+        batches.append(batch)
     return batches
 
 
-def create_priority_batches(streams_df, total_count, batch_size, priority_column="priority"):
+def create_priority_batches(streams_df, stream_ids, batch_size, priority_column="priority"):
     """
     Create batches for optimization based on stream priorities.
     Higher priority streams (higher numerical values) are placed in earlier batches.
     
     Args:
         streams_df: DataFrame containing stream information with priority column
-        total_count: Total number of streams
+        stream_ids: List of valid stream IDs to include in batches
         batch_size: Maximum number of streams per batch
         priority_column: Column name for priority in the DataFrame (default: 'priority')
         
     Returns:
-        List of batches, where each batch is a list of stream indices
+        List of batches, where each batch is a list of stream IDs
     """
     batches = []
     
     # Check if priority column exists
-    if streams_df is not None and priority_column in streams_df.columns:
+    if streams_df is not None and priority_column in streams_df.columns and not streams_df.empty:
         print("Creating batches based on stream priority (higher priority value = higher priority)")
         
-        # Create a mapping of indices to priorities
+        # Create a mapping of stream IDs to priorities
         priorities = {}
-        for idx, row in streams_df.iterrows():
-            stream_idx = idx
-            priority = row[priority_column]
-            priorities[stream_idx] = priority
-            
-        # Sort stream indices by priority (HIGHER value = higher priority)
-        sorted_indices = sorted(priorities.keys(), key=lambda x: priorities.get(x, 0), reverse=True)
+        for stream_id in stream_ids:
+            # Assume stream_id is the row index in the DataFrame
+            # This depends on how stream IDs are assigned in DataFactory
+            if stream_id < len(streams_df):
+                priority = streams_df.iloc[stream_id].get(priority_column, 0)
+                priorities[stream_id] = priority
+            else:
+                priorities[stream_id] = 0  # Default priority
+        
+        # Sort stream IDs by priority (HIGHER value = higher priority)
+        sorted_ids = sorted(priorities.keys(), key=lambda x: priorities.get(x, 0), reverse=True)
         
         # Create batches based on priority order
-        for i in range(0, len(sorted_indices), batch_size):
-            batch = sorted_indices[i:i + batch_size]
+        for i in range(0, len(sorted_ids), batch_size):
+            batch = sorted_ids[i:i + batch_size]
             batches.append(batch)
             
         # Print priority distribution
-        priority_counts = streams_df[priority_column].value_counts().sort_index()
-        print(f"Priority distribution: {dict(priority_counts)}")
+        if 'priority' in streams_df.columns:
+            priority_counts = streams_df[priority_column].value_counts().sort_index()
+            print(f"Priority distribution: {dict(priority_counts)}")
     else:
         print("No priority information found. Creating batches sequentially.")
-        start = 0
-        while start < total_count:
-            end = min(start + batch_size, total_count)
-            batches.append([x for x in range(start, end)])
-            start = end
+        batches = create_batches(stream_ids, batch_size)
     
     return batches
 
@@ -177,41 +177,45 @@ def main():
                 
         print("Input files copied.")
         
-        # Set up config path
-        config_path = args.config
-        if not config_path:
-            config_path = path_manager.link_config_input_dir
-
-        # Create stream dictionary
-        print(f"\n--- Creating Stream Dictionary (k_paths={args.k_paths}) ---")
-        stream_dict_creator = StreamDictCreator(
-            input_path=path_manager.input_dir,
-            output_path=path_manager.output_dir,
-            config_path=config_path,
+        # Load data
+        print("\n--- Loading Data ---")
+        streams = load_streams_from_csv(path_manager.streams_output_dir)
+        network_graph = load_graphml(path_manager.network_graphml_input_dir)
+        link_config = load_yaml_file(path_manager.link_config_input_dir)
+        
+        if not streams:
+            raise ValueError("Failed to load streams from CSV")
+        if not network_graph:
+            raise ValueError("Failed to load network graph")
+        if not link_config:
+            raise ValueError("Failed to load link configuration")
+            
+        print(f"Loaded {len(streams)} streams, {len(network_graph.nodes)} nodes, and {len(network_graph.edges)} edges")
+        
+        # Create DataFactory with stream limit from args.streams
+        print(f"\n--- Initializing DataFactory with k_paths={args.k_paths} ---")
+        data_factory = DataFactory(
+            link_config=link_config,
+            graph_nx=network_graph,
+            raw_streams=streams,
             k_path_count=args.k_paths,
+            lcm_rep=1,
+            stream_limit=args.streams  
         )
-
-        # Load all packets and graph data
-        packets, graph_nx = stream_dict_creator.load_data()
         
-        # Limit the number of packets based on args.streams
-        original_packet_count = len(packets)
-        if args.streams < original_packet_count:
-            print(f"Limiting input streams from {original_packet_count} to {args.streams}")
-            packets = packets[:args.streams]  # Take only the first args.streams packets
+        print(f"DataFactory initialized with {len(data_factory.stream_dict)} streams and {len(data_factory.ports)} ports")
         
-        # Create stream dictionary with the limited set of packets
-        stream_dict = stream_dict_creator.populate_stream_dict(packets, graph_nx)
-        save_as_graphml(graph_nx, path_manager.output_dir, "network.graphml")
-        print(f"Stream dictionary created with {len(stream_dict)} streams")
+        # Save the processed network graph
+        save_as_graphml(network_graph, path_manager.output_dir, "network_processed.graphml")
         
         # Determine number of streams to process
-        total_count = len(stream_dict)
+        stream_ids = list(data_factory.stream_dict.keys())
+        total_count = len(stream_ids)
         batch_size = args.batch_size
         print(f"Processing {total_count} streams in batches of {batch_size}")
         
         # Create batches based on priority if available
-        batches = create_priority_batches(streams_df, total_count, batch_size)
+        batches = create_priority_batches(streams_df, stream_ids, batch_size)
         
         # Print batch information
         print(f"Created {len(batches)} batches:")
@@ -219,28 +223,26 @@ def main():
             if streams_df is not None and 'priority' in streams_df.columns:
                 # Get priorities for this batch if we have that information
                 batch_priorities = []
-                for stream_idx in batch:
-                    if stream_idx < len(streams_df):
-                        priority = streams_df.iloc[stream_idx]['priority'] if 'priority' in streams_df.columns else '?'
+                for stream_id in batch:
+                    if stream_id < len(streams_df):
+                        priority = streams_df.iloc[stream_id]['priority'] if 'priority' in streams_df.columns else '?'
                         batch_priorities.append(priority)
                     else:
                         batch_priorities.append('?')
-                print(f"  Batch {i+1}: {len(batch)} streams, indices: {batch}, priorities: {batch_priorities}")
+                print(f"  Batch {i+1}: {len(batch)} streams, IDs: {batch}, priorities: {batch_priorities}")
             else:
-                print(f"  Batch {i+1}: {len(batch)} streams, indices: {batch}")
+                print(f"  Batch {i+1}: {len(batch)} streams, IDs: {batch}")
         
         # Run optimization
         print(f"\n--- Running Optimization (time_limit={args.time_limit} seconds) ---")
         (
             status,
-            variables,
             variables_x,
-            variables_y,
             variables_z,
             variables_a,
             timing_info,
         ) = solve_with_batches(
-            stream_dict=stream_dict,
+            data_factory=data_factory,  # Pass DataFactory instance directly
             output_path=path_manager.output_dir,
             batches=batches,
             time_limit=args.time_limit,
@@ -252,9 +254,8 @@ def main():
         
         # Save results
         print("\n--- Saving Results ---")
-        save_as_pkl(stream_dict, path_manager.output_dir, "stream_dict.pkl")
+        save_as_pkl(data_factory.stream_dict, path_manager.output_dir, "stream_dict.pkl")
         save_as_pkl(variables_x, path_manager.output_dir, "variables_x.pkl")
-        save_as_pkl(variables_y, path_manager.output_dir, "variables_y.pkl")
         save_as_pkl(variables_z, path_manager.output_dir, "variables_z.pkl")
         save_as_pkl(variables_a, path_manager.output_dir, "variables_a.pkl")
         print(f"Results saved.")

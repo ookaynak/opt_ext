@@ -6,6 +6,17 @@ models/output_generator.py
 models/batches/__init__.py
 models/batches/main.py
 models/batches/optimization_model.py
+scenario_creator/__init__.py
+scenario_creator/main_medium.py
+scenario_creator/main_small.py
+scenario_creator/main_small_robustness.py
+scenario_creator/network_generator.py
+simulator_not_updated/__init__.py
+simulator_not_updated/main.py
+simulator_not_updated/objects.py
+simulator_not_updated/output_analysis.py
+simulator_not_updated/state_tracker.py
+simulator_not_updated/test_integration.py
 stream_dictionary_creator/__init__.py
 stream_dictionary_creator/main.py
 stream_dictionary_creator/stream_dict_creator.py
